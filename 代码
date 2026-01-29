@@ -1,0 +1,600 @@
+// ==================== 飞书机器人配置 ====================
+var FEISHU_CONFIG = {
+  // 【必填】飞书群机器人的Webhook地址
+  WEBHOOK_URL: 'https://open.feishu.cn/open-apis/bot/v2/hook/ced677c5-a1eb-4bbc-97a1-973a041d23d2',
+  
+  // 【可选】签名密钥（如果飞书机器人开启了签名校验）
+  SECRET: '',
+  
+  // 【必填】消息类型：'interactive'(推荐)、'text'、'post'
+  MSG_TYPE: 'interactive',
+  
+  // 【可选】消息标题颜色（仅interactive类型有效）
+  HEADER_COLOR: 'blue',
+  
+  // 【可选】是否@特定用户（填写用户ID）
+  AT_USERS: [],
+  
+  // 【可选】是否@所有人
+  AT_ALL: false,
+  
+  // 【可选】邮件内容截断长度
+  MAX_CONTENT_LENGTH: 1500,
+  
+  // 【可选】调试模式
+  DEBUG_MODE: true,
+  
+  // ========== 【新增】邮件筛选规则配置 ==========
+  FILTER_RULES: {
+    // 发件人白名单（支持完整邮箱或域名，如：'@company.com'匹配整个域名）
+    senders: [ ],
+    
+    // 主题关键词（模糊匹配，OR关系）
+    subjectKeywords: ['netflix', '暫時存取碼'],
+    
+    // 正文关键词（模糊匹配，OR关系）
+    bodyKeywords: ['netflix', '暫時存取碼'],
+    
+    // 匹配模式：'OR'(任一条件满足) 或 'AND'(所有条件满足)
+    matchMode: 'OR',
+    
+    // 是否只处理未读邮件
+    onlyUnread: true,
+    
+    // 是否在处理后将邮件标记为已读
+    markAsRead: true,
+    
+    // 最大处理邮件数（防止超时）
+    maxEmails: 20
+  }
+};
+
+// ==================== 核心功能函数 ====================
+
+/**
+ * 主函数：将符合条件的邮件转发到飞书
+ */
+function forwardEmailsToFeishu() {
+  logDebug('开始执行邮件筛选转发任务...');
+  
+  // 1. 构建邮件搜索条件
+  var searchQuery = buildFilterSearchQuery();
+  logDebug('搜索条件: ' + (searchQuery || '无筛选条件'));
+  
+  // 2. 搜索邮件
+  var threads = GmailApp.search(searchQuery, 0, FEISHU_CONFIG.FILTER_RULES.maxEmails);
+  logDebug('找到 ' + threads.length + ' 封符合条件的邮件');
+  
+  if (threads.length === 0) {
+    logDebug('没有符合条件的邮件，任务结束');
+    return { success: 0, failed: 0, total: 0 };
+  }
+  
+  var processedCount = 0;
+  var errorCount = 0;
+  
+  // 3. 处理每封邮件
+  for (var i = 0; i < threads.length; i++) {
+    var messages = threads[i].getMessages();
+    
+    for (var j = 0; j < messages.length; j++) {
+      var message = messages[j];
+      
+      try {
+        logDebug('处理邮件: ' + message.getSubject());
+        
+        // 提取邮件数据（包含链接转换）
+        var emailData = extractEmailForFeishu(message);
+        
+        // 发送到飞书
+        var success = sendToFeishuWebhook(emailData);
+        
+        if (success) {
+          if (FEISHU_CONFIG.FILTER_RULES.markAsRead) {
+            message.markRead();
+          }
+          processedCount++;
+          logDebug('成功发送到飞书: ' + message.getSubject());
+        } else {
+          errorCount++;
+          logDebug('发送失败: ' + message.getSubject());
+        }
+        
+        Utilities.sleep(500); // 避免请求过快
+        
+      } catch (error) {
+        errorCount++;
+        logDebug('处理邮件时出错: ' + error.toString());
+      }
+    }
+  }
+  
+  // 4. 发送汇总通知
+  if (processedCount > 0) {
+    sendSummaryNotification(processedCount, errorCount, threads.length);
+  }
+  
+  logDebug('任务完成。成功: ' + processedCount + ', 失败: ' + errorCount);
+  return {
+    success: processedCount,
+    failed: errorCount,
+    total: threads.length
+  };
+}
+
+/**
+ * 根据筛选规则构建Gmail搜索查询
+ */
+function buildFilterSearchQuery() {
+  var rules = FEISHU_CONFIG.FILTER_RULES;
+  var queryParts = [];
+  
+  // 构建发件人条件
+  if (rules.senders && rules.senders.length > 0) {
+    var senderQueries = rules.senders.map(function(sender) {
+      return sender.startsWith('@') ? 'from:*' + sender : 'from:' + sender;
+    });
+    queryParts.push('(' + senderQueries.join(' OR ') + ')');
+  }
+  
+  // 构建主题条件
+  if (rules.subjectKeywords && rules.subjectKeywords.length > 0) {
+    var subjectQueries = rules.subjectKeywords.map(function(keyword) {
+      return 'subject:' + keyword;
+    });
+    queryParts.push('(' + subjectQueries.join(' OR ') + ')');
+  }
+  
+  // 构建正文条件
+  if (rules.bodyKeywords && rules.bodyKeywords.length > 0) {
+    var bodyQueries = rules.bodyKeywords.map(function(keyword) {
+      return '"' + keyword + '"';
+    });
+    queryParts.push('(' + bodyQueries.join(' OR ') + ')');
+  }
+  
+  // 组合所有条件
+  var finalQuery = '';
+  if (queryParts.length > 0) {
+    var connector = (rules.matchMode === 'AND') ? ' AND ' : ' OR ';
+    finalQuery = queryParts.join(connector);
+  }
+  
+  // 添加未读条件
+  if (rules.onlyUnread) {
+    if (finalQuery) {
+      finalQuery = '(' + finalQuery + ') AND is:unread';
+    } else {
+      finalQuery = 'is:unread';
+    }
+  }
+  
+  // 如果没有设置任何条件，默认不匹配任何邮件
+  if (!finalQuery) {
+    finalQuery = 'subject:"__NO_MATCH__"';
+  }
+  
+  return finalQuery;
+}
+
+/**
+ * 提取邮件数据并转换链接
+ */
+function extractEmailForFeishu(message) {
+  // 获取邮件基本信息
+  var from = message.getFrom();
+  var to = message.getTo();
+  var subject = message.getSubject();
+  var date = message.getDate();
+  var htmlBody = message.getBody();
+  var plainBody = message.getPlainBody() || '（无正文内容）';
+  
+  // 处理链接：将HTML中的<a>标签转换为Markdown格式
+  var processedBody = '';
+  if (htmlBody) {
+    // 转换链接：<a href="URL">TEXT</a> -> [TEXT](URL)
+    processedBody = htmlBody.replace(/<a\s+(?:[^>]*?\s+)?href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, '[$2]($1)');
+    // 移除剩余的HTML标签
+    processedBody = processedBody.replace(/<[^>]+>/g, '');
+    // 处理HTML实体
+    processedBody = processedBody.replace(/&nbsp;/g, ' ')
+                                .replace(/&amp;/g, '&')
+                                .replace(/&lt;/g, '<')
+                                .replace(/&gt;/g, '>');
+  } else {
+    processedBody = plainBody;
+  }
+  
+  // 截断过长的正文
+  if (processedBody.length > FEISHU_CONFIG.MAX_CONTENT_LENGTH) {
+    processedBody = processedBody.substring(0, FEISHU_CONFIG.MAX_CONTENT_LENGTH) + '...（内容已截断）';
+  }
+  
+  // 获取附件信息
+  var attachments = message.getAttachments();
+  var attachmentInfo = [];
+  var maxAttachments = Math.min(attachments.length, 3);
+  
+  for (var k = 0; k < maxAttachments; k++) {
+    var att = attachments[k];
+    attachmentInfo.push({
+      name: att.getName(),
+      size: formatFileSize(att.getSize()),
+      type: att.getContentType()
+    });
+  }
+  
+  // 解析发件人
+  var fromMatch = from.match(/(?:["']?([^"']+)["']?\s*)?<?([^<>]+@[^<>]+)>?/);
+  var senderName = fromMatch && fromMatch[1] ? fromMatch[1].trim() : '';
+  var senderEmail = fromMatch && fromMatch[2] ? fromMatch[2].trim() : from;
+  
+  return {
+    id: message.getId(),
+    threadId: message.getThread().getId(),
+    senderName: senderName,
+    senderEmail: senderEmail,
+    to: to,
+    subject: subject,
+    body: processedBody,
+    htmlBody: htmlBody,
+    date: date,
+    attachments: attachmentInfo,
+    hasMoreAttachments: attachments.length > 3,
+    timestamp: new Date().toISOString()
+  };
+}
+
+/**
+ * 发送邮件数据到飞书Webhook（支持签名校验）
+ */
+function sendToFeishuWebhook(emailData) {
+  try {
+    // 构建飞书消息
+    var feishuMessage = buildFeishuMessage(emailData);
+    
+    // 生成最终URL（如果启用了签名）
+    var finalWebhookUrl = FEISHU_CONFIG.WEBHOOK_URL;
+    if (FEISHU_CONFIG.SECRET) {
+      finalWebhookUrl = generateSignedFeishuUrl(FEISHU_CONFIG.WEBHOOK_URL, FEISHU_CONFIG.SECRET);
+    }
+    
+    // 准备请求选项
+    var options = {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(feishuMessage),
+      muteHttpExceptions: true,
+      timeout: 15000
+    };
+    
+    logDebug('发送请求到飞书: ' + finalWebhookUrl);
+    
+    // 发送请求
+    var response = UrlFetchApp.fetch(finalWebhookUrl, options);
+    var responseCode = response.getResponseCode();
+    var responseText = response.getContentText();
+    
+    logDebug('飞书响应状态码: ' + responseCode);
+    logDebug('飞书响应内容: ' + responseText);
+    
+    // 解析响应
+    if (responseCode === 200) {
+      var result = JSON.parse(responseText);
+      if (result.StatusCode === 0 || result.code === 0) {
+        logDebug('飞书消息发送成功');
+        return true;
+      } else {
+        logDebug('飞书返回业务错误: ' + JSON.stringify(result));
+        return false;
+      }
+    } else {
+      logDebug('HTTP请求失败，状态码: ' + responseCode);
+      return false;
+    }
+    
+  } catch (error) {
+    logDebug('发送到飞书时发生异常: ' + error.toString());
+    return false;
+  }
+}
+
+/**
+ * 生成带签名的飞书Webhook URL
+ */
+function generateSignedFeishuUrl(webhookUrl, secret) {
+  var timestamp = Math.floor(Date.now() / 1000); // 秒级时间戳
+  var stringToSign = timestamp + "\n" + secret;
+  var sign = Utilities.computeHmacSha256Signature(stringToSign, secret);
+  var signBase64 = Utilities.base64Encode(sign);
+  
+  return webhookUrl + "?timestamp=" + timestamp + "&sign=" + encodeURIComponent(signBase64);
+}
+
+/**
+ * 构建飞书消息
+ */
+function buildFeishuMessage(emailData) {
+  var msgType = FEISHU_CONFIG.MSG_TYPE;
+  
+  switch (msgType) {
+    case 'text':
+      return buildTextMessage(emailData);
+    case 'post':
+      return buildPostMessage(emailData);
+    case 'interactive':
+    default:
+      return buildInteractiveCard(emailData);
+  }
+}
+
+/**
+ * 构建交互卡片消息（推荐）
+ */
+function buildInteractiveCard(emailData) {
+  var card = {
+    msg_type: 'interactive',
+    card: {
+      config: {
+        wide_screen_mode: true,
+        enable_forward: true
+      },
+      header: {
+        title: {
+          tag: 'plain_text',
+          content: '📧 新邮件通知'
+        },
+        template: FEISHU_CONFIG.HEADER_COLOR
+      },
+      elements: []
+    }
+  };
+  
+  // 邮件信息
+  var infoContent = '**发件人:** ' + 
+                   (emailData.senderName ? emailData.senderName + ' ' : '') +
+                   '<' + emailData.senderEmail + '>\n\n' +
+                   '**收件人:** ' + emailData.to + '\n\n' +
+                   '**主题:** ' + emailData.subject + '\n\n' +
+                   '**时间:** ' + formatDateForDisplay(emailData.date);
+  
+  card.card.elements.push({
+    tag: 'div',
+    text: {
+      tag: 'lark_md',
+      content: infoContent
+    }
+  });
+  
+  // 分割线
+  card.card.elements.push({ tag: 'hr' });
+  
+  // 邮件正文（链接已转换为可点击格式）
+  card.card.elements.push({
+    tag: 'div',
+    text: {
+      tag: 'lark_md',
+      content: emailData.body
+    }
+  });
+  
+  // 附件信息
+  if (emailData.attachments.length > 0) {
+    card.card.elements.push({ tag: 'hr' });
+    
+    var attachmentText = '**附件:**\n';
+    for (var i = 0; i < emailData.attachments.length; i++) {
+      var att = emailData.attachments[i];
+      attachmentText += '• ' + att.name + ' (' + att.size + ')\n';
+    }
+    
+    if (emailData.hasMoreAttachments) {
+      attachmentText += '• ...还有' + (emailData.attachments.length - 3) + '个附件';
+    }
+    
+    card.card.elements.push({
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: attachmentText
+      }
+    });
+  }
+  
+  // 底部备注
+  card.card.elements.push({
+    tag: 'note',
+    elements: [{
+      tag: 'plain_text',
+      content: '邮件ID: ' + emailData.id.substring(0, 20) + '...'
+    }]
+  });
+  
+  // @提醒
+  if (FEISHU_CONFIG.AT_USERS.length > 0 || FEISHU_CONFIG.AT_ALL) {
+    card.card.elements.push({
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: buildAtContent()
+      }
+    });
+  }
+  
+  return card;
+}
+
+/**
+ * 构建纯文本消息
+ */
+function buildTextMessage(emailData) {
+  var content = '📧 收到新邮件\n\n' +
+                '发件人: ' + emailData.senderEmail + '\n' +
+                '主题: ' + emailData.subject + '\n' +
+                '时间: ' + formatDateForDisplay(emailData.date) + '\n\n' +
+                '内容摘要:\n' + emailData.body.substring(0, 500);
+  
+  if (emailData.body.length > 500) content += '...';
+  
+  var message = {
+    msg_type: 'text',
+    content: {
+      text: content + '\n\n' + buildAtContent()
+    }
+  };
+  
+  return message;
+}
+
+// ==================== 辅助函数 ====================
+
+/**
+ * 构建@提醒内容
+ */
+function buildAtContent() {
+  var atContent = '';
+  
+  if (FEISHU_CONFIG.AT_ALL) {
+    atContent += '<at user_id="all">所有人</at> ';
+  }
+  
+  FEISHU_CONFIG.AT_USERS.forEach(function(userId) {
+    atContent += '<at user_id="' + userId + '"></at> ';
+  });
+  
+  return atContent.trim();
+}
+
+/**
+ * 发送任务汇总通知
+ */
+function sendSummaryNotification(successCount, errorCount, totalCount) {
+  var summaryData = {
+    id: 'summary_' + new Date().getTime(),
+    senderName: 'Gmail转发机器人',
+    senderEmail: 'bot@gmail-forwarder',
+    to: '飞书群',
+    subject: '邮件转发任务报告',
+    body: '本次执行共发现 ' + totalCount + ' 封邮件。\n' +
+          '成功转发: ' + successCount + ' 封\n' +
+          '处理失败: ' + errorCount + ' 封\n' +
+          '时间: ' + new Date().toLocaleString(),
+    date: new Date(),
+    attachments: [],
+    hasMoreAttachments: false,
+    timestamp: new Date().toISOString()
+  };
+  
+  sendToFeishuWebhook(summaryData);
+}
+
+/**
+ * 格式化文件大小
+ */
+function formatFileSize(bytes) {
+  if (bytes === 0) return '0 Bytes';
+  var k = 1024;
+  var sizes = ['Bytes', 'KB', 'MB', 'GB'];
+  var i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+/**
+ * 格式化日期显示
+ */
+function formatDateForDisplay(date, includeTime) {
+  if (!date) return '';
+  
+  var d = new Date(date);
+  var dateStr = d.getFullYear() + '-' + 
+                ('0' + (d.getMonth() + 1)).slice(-2) + '-' + 
+                ('0' + d.getDate()).slice(-2);
+  
+  if (includeTime) {
+    dateStr += ' ' + ('0' + d.getHours()).slice(-2) + ':' + 
+               ('0' + d.getMinutes()).slice(-2) + ':' + 
+               ('0' + d.getSeconds()).slice(-2);
+  }
+  
+  return dateStr;
+}
+
+/**
+ * 调试日志函数
+ */
+function logDebug(message) {
+  if (FEISHU_CONFIG.DEBUG_MODE) {
+    Logger.log('[DEBUG] ' + message);
+  }
+}
+
+// ==================== 测试函数 ====================
+
+/**
+ * 测试飞书连接
+ */
+function testFeishuConnection() {
+  Logger.log('🔧 开始测试飞书机器人连接...');
+  
+  var testEmailData = {
+    id: 'test_' + new Date().getTime(),
+    senderName: '测试发件人',
+    senderEmail: 'test@sender.com',
+    to: 'your-email@gmail.com',
+    subject: '🔔 飞书机器人连接测试',
+    body: '这是一条测试消息，包含一个示例链接：[点击这里](https://example.com)',
+    date: new Date(),
+    attachments: [],
+    hasMoreAttachments: false,
+    timestamp: new Date().toISOString()
+  };
+  
+  Logger.log('测试数据准备完成');
+  Logger.log('Webhook URL: ' + FEISHU_CONFIG.WEBHOOK_URL);
+  
+  var success = sendToFeishuWebhook(testEmailData);
+  
+  if (success) {
+    Logger.log('✅ 测试成功！请检查飞书群是否收到测试消息。');
+  } else {
+    Logger.log('❌ 测试失败！请检查配置。');
+  }
+  
+  return success;
+}
+
+/**
+ * 测试筛选规则
+ */
+function testFilterRules() {
+  Logger.log('🧪 测试邮件筛选规则...');
+  
+  var rules = FEISHU_CONFIG.FILTER_RULES;
+  Logger.log('当前配置:');
+  Logger.log('- 发件人: ' + (rules.senders.join(', ') || '无'));
+  Logger.log('- 主题关键词: ' + (rules.subjectKeywords.join(', ') || '无'));
+  Logger.log('- 正文关键词: ' + (rules.bodyKeywords.join(', ') || '无'));
+  Logger.log('- 匹配模式: ' + rules.matchMode);
+  
+  var searchQuery = buildFilterSearchQuery();
+  Logger.log('生成的搜索语句: ' + searchQuery);
+  
+  var threads = GmailApp.search(searchQuery, 0, 5);
+  Logger.log('找到 ' + threads.length + ' 封测试邮件');
+  
+  for (var i = 0; i < Math.min(threads.length, 3); i++) {
+    var messages = threads[i].getMessages();
+    if (messages.length > 0) {
+      var msg = messages[0];
+      Logger.log((i+1) + '. 主题: "' + msg.getSubject() + '" | 发件人: ' + msg.getFrom());
+    }
+  }
+}
+
+// ==================== 使用说明 ====================
+// 1. 修改 FEISHU_CONFIG 中的 WEBHOOK_URL（必填）
+// 2. 如果飞书机器人启用了签名校验，填写 SECRET
+// 3. 在 FILTER_RULES 中配置邮件筛选条件
+// 4. 运行 testFeishuConnection() 测试连接
+// 5. 运行 forwardEmailsToFeishu() 手动测试
+// 6. 配置触发器定期执行 forwardEmailsToFeishu()
