@@ -1,7 +1,7 @@
 // ==================== 飞书机器人配置 ====================
 var FEISHU_CONFIG = {
   // 【必填】飞书群机器人的Webhook地址
-  WEBHOOK_URL: 'https://open.feishu.cn/open-apis/bot/v2/hook/ced677c5-a1eb-4bbc-97a1-973a041d23d2',
+  WEBHOOK_URL: '粘贴Webhook 地址',
   
   // 【可选】签名密钥（如果飞书机器人开启了签名校验）
   SECRET: '',
@@ -30,10 +30,10 @@ var FEISHU_CONFIG = {
     senders: [ ],
     
     // 主题关键词（模糊匹配，OR关系）
-    subjectKeywords: ['netflix', '暫時存取碼'],
+    subjectKeywords: ['xxx', 'xxx'],
     
     // 正文关键词（模糊匹配，OR关系）
-    bodyKeywords: ['netflix', '暫時存取碼'],
+    bodyKeywords: ['xxx', 'xxx'],
     
     // 匹配模式：'OR'(任一条件满足) 或 'AND'(所有条件满足)
     matchMode: 'OR',
